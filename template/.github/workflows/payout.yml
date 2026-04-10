@@ -1,0 +1,179 @@
+name: Prepare Payout
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    paths:
+      - "CLOSE.md"   # triggered when client merges an early-close PR
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  prepare-payout:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read current status
+        id: state
+        run: |
+          echo "status=$(grep '^Status:' STATUS.md | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      # If triggered by a CLOSE.md push, transition the state first
+      - name: Set status to PAYOUT_READY on early close
+        if: github.event_name == 'push'
+        run: |
+          CURRENT="${{ steps.state.outputs.status }}"
+          if [[ "$CURRENT" == "SWARM_ACTIVE" || "$CURRENT" == "ROLL_CALL_OPEN" ]]; then
+            sed -i "s/^Status: .*/Status: PAYOUT_READY/" STATUS.md
+            printf "\nClosed-Early: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> STATUS.md
+            git config user.name  "hermes-cowork[bot]"
+            git config user.email "bot@hermes-cowork.io"
+            git add STATUS.md
+            git commit -m "bot: CLOSE.md merged — early close, status PAYOUT_READY"
+            git push
+          fi
+
+      - name: Install requests
+        run: pip install requests --quiet
+
+      - name: Build payout summary
+        id: summary
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, sys, requests
+          from datetime import datetime, timezone
+
+          # ── Parse ESCROW.md ───────────────────────────────────────────────
+          escrow = {}
+          with open("ESCROW.md") as f:
+              for line in f:
+                  line = line.strip()
+                  for key in ("Address", "Redeem-Script", "Required-Sats",
+                              "Pod-Cap", "Platform-Fee-Pct", "Network"):
+                      if line.startswith(f"{key}:"):
+                          escrow[key] = line.split(":", 1)[1].strip()
+
+          address   = escrow.get("Address", "").strip()
+          network   = escrow.get("Network", "mainnet")
+          fee_pct   = float(escrow.get("Platform-Fee-Pct", "15") or 15) / 100.0
+
+          if not address or address == "[GENERATED_BY_OPERATOR]":
+              print("ERROR: Escrow address not set in ESCROW.md.", file=sys.stderr)
+              sys.exit(1)
+
+          # ── Parse ROLLCALL.md ─────────────────────────────────────────────
+          pods = []
+          with open("ROLLCALL.md") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line.startswith("|"):
+                      continue
+                  if "Pod ID" in line or re.fullmatch(r"[| \-]+", line):
+                      continue
+                  parts = [p.strip() for p in line.strip("|").split("|")]
+                  if len(parts) >= 4 and parts[3] and parts[3] != "Bitcoin Payout Address":
+                      pods.append({"pod_id": parts[0], "handle": parts[1], "address": parts[3]})
+
+          if not pods:
+              print("ERROR: No pods found in ROLLCALL.md.", file=sys.stderr)
+              sys.exit(1)
+
+          # ── Fetch UTXOs ───────────────────────────────────────────────────
+          api = ("https://blockstream.info/testnet/api"
+                 if network == "testnet" else "https://blockstream.info/api")
+          try:
+              resp = requests.get(f"{api}/address/{address}/utxo", timeout=20)
+              resp.raise_for_status()
+              utxos = [u for u in resp.json() if u.get("status", {}).get("confirmed")]
+          except Exception as e:
+              print(f"ERROR fetching UTXOs: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          if not utxos:
+              print("ERROR: No confirmed UTXOs at escrow address.", file=sys.stderr)
+              sys.exit(1)
+
+          total_sats   = sum(u["value"] for u in utxos)
+          platform_fee = int(total_sats * fee_pct)
+          n_outputs    = len(pods) + 1      # +1 for platform fee
+          est_vbytes   = 10 + 41 * len(utxos) + 31 * n_outputs
+          tx_fee       = est_vbytes * 5     # 5 sat/vbyte
+          distributable = total_sats - platform_fee - tx_fee
+          per_pod      = distributable // len(pods)
+          remainder    = distributable - per_pod * len(pods)
+
+          # ── Write summary ─────────────────────────────────────────────────
+          lines = [
+              "## Payout Transaction Ready",
+              "",
+              f"**Escrow address:** `{address}`  ",
+              f"**Network:** {network}  ",
+              f"**Total confirmed sats:** {total_sats:,}  ",
+              f"**Platform fee (15%):** {platform_fee:,} sats  ",
+              f"**Estimated TX fee:** {tx_fee:,} sats ({est_vbytes} vbytes @ 5 sat/vbyte)  ",
+              f"**Distributable:** {distributable:,} sats  ",
+              f"**Pods:** {len(pods)}  ",
+              f"**Per-pod payout:** {per_pod:,} sats",
+              "",
+              "### Recipients",
+              "",
+              "| Pod | Handle | Bitcoin Address | Sats |",
+              "|-----|--------|-----------------|------|",
+          ]
+          for i, pod in enumerate(pods):
+              amt = per_pod + (remainder if i == 0 else 0)
+              lines.append(f"| {pod['pod_id']} | {pod['handle']} | `{pod['address']}` | {amt:,} |")
+
+          lines += [
+              "",
+              "### UTXOs to spend",
+              "",
+              "| TXID | Vout | Sats |",
+              "|------|------|------|",
+          ]
+          for u in utxos:
+              lines.append(f"| `{u['txid']}` | {u['vout']} | {u['value']:,} |")
+
+          lines += [
+              "",
+              "---",
+              "",
+              "### Platform Operator: Next Steps",
+              "",
+              "1. Run `scripts/build_payout.py` locally to generate the unsigned transaction hex:",
+              "   ```",
+              f"   python scripts/build_payout.py \\",
+              f"     --rollcall ROLLCALL.md \\",
+              f"     --escrow   ESCROW.md \\",
+              f"     --platform-address <your_btc_address> \\",
+              f"     --network {network} > unsigned_payout.txt",
+              "   ```",
+              "2. Sign the hex with **Key 2** (platform) using Bitcoin Core or Sparrow",
+              "3. Send the partially-signed hex to the client for **Key 1** co-signature",
+              "4. Broadcast the fully-signed transaction",
+              "5. Edit `ESCROW.md`: set `TXID: <broadcast_txid>`",
+              "6. Close this issue",
+          ]
+
+          with open("payout_summary.txt", "w") as f:
+              f.write("\n".join(lines))
+
+          print(f"Summary written. {len(pods)} pods, {total_sats:,} sats total.", file=sys.stderr)
+          PYEOF
+
+      - name: Create payout issue for platform operator
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY=$(cat payout_summary.txt)
+          gh issue create \
+            --title "PAYOUT REQUIRED: operator action needed" \
+            --body "$BODY" \
+            --label "payout-required"

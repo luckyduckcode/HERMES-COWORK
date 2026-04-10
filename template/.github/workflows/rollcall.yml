@@ -1,0 +1,94 @@
+name: Roll Call Enforcement
+
+on:
+  pull_request:
+    paths:
+      - "ROLLCALL.md"
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Check out the base branch (not the PR branch) to read authoritative files
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Read current status and pod cap
+        id: state
+        run: |
+          echo "status=$(grep '^Status:' STATUS.md | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          echo "cap=$(grep '^Pod-Cap:' ESCROW.md | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Reject if roll call is not open
+        if: steps.state.outputs.status != 'ROLL_CALL_OPEN'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "⛔ **Roll call is not open.**
+
+          Current status: \`${{ steps.state.outputs.status }}\`
+
+          Roll call opens automatically once the escrow address is funded.
+          Watch STATUS.md for the transition to \`ROLL_CALL_OPEN\`."
+
+          gh pr close ${{ github.event.pull_request.number }}
+
+      - name: Count pods already in ROLLCALL.md (base branch)
+        if: steps.state.outputs.status == 'ROLL_CALL_OPEN'
+        id: count
+        run: |
+          COUNT=$(python3 -c "
+          import re
+          with open('ROLLCALL.md') as f:
+              lines = f.readlines()
+          n = sum(
+              1 for line in lines
+              if line.strip().startswith('|')
+              and 'Pod ID' not in line
+              and not re.fullmatch(r'[| \-]+', line.strip())
+              and line.strip() != '|'
+          )
+          print(n)
+          ")
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "Pods currently in roll call: ${COUNT} / ${{ steps.state.outputs.cap }}"
+
+      - name: Reject if pod cap is already reached
+        if: >
+          steps.state.outputs.status == 'ROLL_CALL_OPEN' &&
+          fromJSON(steps.count.outputs.count) >= fromJSON(steps.state.outputs.cap)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "⛔ **Pod cap reached.**
+
+          The pod cap of **${{ steps.state.outputs.cap }}** has been filled.
+          Watch this repo — the client may open a \`TOPUP.md\` PR to raise the cap
+          and re-open the roll call for additional pods."
+
+          gh pr close ${{ github.event.pull_request.number }}
+
+      - name: Leave a confirmation comment if the PR is valid
+        if: >
+          steps.state.outputs.status == 'ROLL_CALL_OPEN' &&
+          fromJSON(steps.count.outputs.count) < fromJSON(steps.state.outputs.cap)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SLOT=$(( ${{ steps.count.outputs.count }} + 1 ))
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "✅ **Roll call slot valid.**
+
+          You are in position **${SLOT}** of ${{ steps.state.outputs.cap }}.
+          A maintainer will review and merge this PR shortly.
+
+          > ⚠️ Double-check your Bitcoin payout address — it cannot be changed after merge."

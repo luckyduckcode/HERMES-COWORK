@@ -1,0 +1,76 @@
+name: Check Escrow Funding
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # poll every 10 minutes
+  workflow_dispatch:          # allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  check-funding:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read current status
+        id: state
+        run: |
+          echo "status=$(grep '^Status:' STATUS.md | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          echo "address=$(grep '^Address:' ESCROW.md | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          echo "required=$(grep '^Required-Sats:' ESCROW.md | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already past FUNDING_PENDING
+        if: steps.state.outputs.status != 'FUNDING_PENDING'
+        run: |
+          echo "Status is '${{ steps.state.outputs.status }}' — nothing to do."
+          exit 0
+
+      - name: Query Blockstream Esplora for confirmed balance
+        id: balance
+        run: |
+          ADDR="${{ steps.state.outputs.address }}"
+          if [ -z "$ADDR" ] || [ "$ADDR" = "[GENERATED_BY_OPERATOR]" ]; then
+            echo "ERROR: Escrow address not set in ESCROW.md yet."
+            exit 1
+          fi
+          RESPONSE=$(curl -sf "https://blockstream.info/api/address/${ADDR}" || echo '{}')
+          BALANCE=$(echo "$RESPONSE" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          if 'chain_stats' not in d:
+              print(0)
+              sys.exit(0)
+          c = d['chain_stats']
+          print(c.get('funded_txo_sum', 0) - c.get('spent_txo_sum', 0))
+          ")
+          echo "balance=${BALANCE}" >> "$GITHUB_OUTPUT"
+          echo "Confirmed balance at ${ADDR}: ${BALANCE} sats"
+
+      - name: Open roll call if escrow is funded
+        run: |
+          BALANCE="${{ steps.balance.outputs.balance }}"
+          REQUIRED="${{ steps.state.outputs.required }}"
+
+          if python3 -c "import sys; sys.exit(0 if int('$BALANCE') >= int('$REQUIRED') else 1)"; then
+            echo "Funded! (${BALANCE} sats confirmed). Opening roll call."
+
+            OPENED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            DEADLINE=$(date -u -d "+30 days" +%Y-%m-%d 2>/dev/null || date -u -v+30d +%Y-%m-%d)
+
+            # Transition STATE.md
+            sed -i "s/^Status: FUNDING_PENDING/Status: ROLL_CALL_OPEN/" STATUS.md
+            printf "\nRoll-Call-Opened: %s\nDeadline: %s\n" "$OPENED" "$DEADLINE" >> STATUS.md
+
+            git config user.name  "hermes-cowork[bot]"
+            git config user.email "bot@hermes-cowork.io"
+            git add STATUS.md
+            git commit -m "bot: escrow confirmed (${BALANCE} sats) — roll call open, deadline ${DEADLINE}"
+            git push
+          else
+            echo "Waiting for funds. Confirmed: ${BALANCE} sats, Required: ${REQUIRED} sats."
+          fi

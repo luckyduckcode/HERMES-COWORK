@@ -1,0 +1,117 @@
+name: Deadline Monitor
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # check every hour
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-deadlines:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read current status
+        id: state
+        run: |
+          echo "status=$(grep '^Status:' STATUS.md | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          echo "opened=$(grep '^Roll-Call-Opened:' STATUS.md | awk '{print $2}' || echo '')" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if swarm is not active
+        if: steps.state.outputs.status != 'SWARM_ACTIVE'
+        run: |
+          echo "Status is '${{ steps.state.outputs.status }}' — nothing to check."
+          exit 0
+
+      - name: Check 3-day and 30-day marks
+        id: deadline_check
+        run: |
+          python3 - <<'PYEOF'
+          import os, subprocess, sys
+          from datetime import datetime, timezone, timedelta
+
+          opened_str = "${{ steps.state.outputs.opened }}"
+          if not opened_str:
+              print("No Roll-Call-Opened timestamp found — skipping.", file=sys.stderr)
+              sys.exit(0)
+
+          opened = datetime.fromisoformat(opened_str.replace("Z", "+00:00"))
+          now    = datetime.now(timezone.utc)
+          day3   = opened + timedelta(days=3)
+          day30  = opened + timedelta(days=30)
+
+          with open("STATUS.md") as f:
+              content = f.read()
+
+          changed        = False
+          notify_day3    = False
+          payout_ready   = False
+
+          # 3-day notification (one-shot)
+          if now >= day3 and "Day3-Notified:" not in content:
+              content += f"\nDay3-Notified: {now.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+              changed     = True
+              notify_day3 = True
+              print("3-day mark reached.", file=sys.stderr)
+
+          # 30-day payout trigger
+          if now >= day30:
+              if "Status: SWARM_ACTIVE" in content:
+                  content = content.replace("Status: SWARM_ACTIVE", "Status: PAYOUT_READY")
+                  content += f"\nPayout-Ready: {now.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                  changed      = True
+                  payout_ready = True
+                  print("30-day deadline reached — PAYOUT_READY.", file=sys.stderr)
+
+          if changed:
+              with open("STATUS.md", "w") as f:
+                  f.write(content)
+              subprocess.run(["git", "config", "user.name",  "hermes-cowork[bot]"], check=True)
+              subprocess.run(["git", "config", "user.email", "bot@hermes-cowork.io"], check=True)
+              subprocess.run(["git", "add", "STATUS.md"], check=True)
+              subprocess.run(["git", "commit", "-m", "bot: deadline checkpoint update"], check=True)
+              subprocess.run(["git", "push"], check=True)
+
+          # Write flag files so later steps can branch on them
+          if notify_day3:
+              open("day3.flag", "w").close()
+          if payout_ready:
+              open("payout_ready.flag", "w").close()
+          PYEOF
+
+      - name: Notify client at 3-day review window
+        if: hashFiles('day3.flag') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "3-Day Review Window: top up, continue, or close?" \
+            --body "The swarm has been running for 3 days. As the client you have three options:
+
+          **Option A — Top up**
+          Send more BTC to the escrow address and open a \`TOPUP.md\` PR to raise the pod cap.
+
+          **Option B — Continue**
+          Do nothing. The swarm runs to the 30-day deadline and payout is automatic.
+
+          **Option C — Close early**
+          Merge a \`CLOSE.md\` PR to immediately trigger full payout to all pods in the roll call.
+
+          See [ESCROW.md](../blob/main/ESCROW.md) for payout formula details.
+
+          _This issue was opened automatically by hermes-cowork[bot]._" \
+            --label "client-review"
+
+      - name: Trigger payout workflow at 30-day deadline
+        if: hashFiles('payout_ready.flag') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run payout.yml
